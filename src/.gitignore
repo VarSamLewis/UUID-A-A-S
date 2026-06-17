@@ -9,6 +9,7 @@
 /vendor/
 
 uuid_service
+uuid-cli
 
 *.db
 *.db-journal
