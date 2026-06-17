@@ -1,0 +1,9 @@
+uuid-cli
+*.db
+*.db-*
+.env
+.git
+.gitignore
+README.md
+docker-compose.yml
+Dockerfile

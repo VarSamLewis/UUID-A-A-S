@@ -1,0 +1,218 @@
+openapi: 3.0.3
+info:
+  title: UUID Service API
+  description: A simple HTTP API that generates and tracks UUIDs.
+  version: 1.0.0
+  contact:
+    name: API Support
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+  - url: https://your-railway-app.up.railway.app
+    description: Railway production server
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Returns the health status of the service.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /metrics:
+    get:
+      summary: Metrics
+      description: Returns basic request metrics.
+      operationId: getMetrics
+      responses:
+        '200':
+          description: Metrics data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+
+  /v1/signup:
+    post:
+      summary: Create user account
+      description: Create a new user account with an email address.
+      operationId: signup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignupRequest'
+      responses:
+        '200':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateUserResponse'
+        '400':
+          description: Bad request - email is required
+        '429':
+          description: Rate limit exceeded
+
+  /v1/login:
+    post:
+      summary: Validate API key
+      description: Validate an API key and return user information.
+      operationId: login
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          description: Unauthorized - invalid or missing API key
+        '429':
+          description: Too many failed login attempts
+
+  /v1/users/{id}:
+    get:
+      summary: Get user by ID
+      description: Retrieve user information by user ID.
+      operationId: getUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: User ID
+      responses:
+        '200':
+          description: User found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          description: Unauthorized
+        '404':
+          description: User not found
+
+  /v1/uuid:
+    post:
+      summary: Generate UUID
+      description: Generate a new UUID and store it associated with the authenticated user.
+      operationId: generateUUID
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: UUID generated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UUIDResponse'
+        '401':
+          description: Unauthorized
+        '429':
+          description: Rate limit exceeded
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: UUID
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: healthy
+
+    MetricsResponse:
+      type: object
+      properties:
+        requests_total:
+          type: integer
+          format: int64
+        requests_errors:
+          type: integer
+          format: int64
+        avg_duration_ms:
+          type: number
+          format: float
+
+    SignupRequest:
+      type: object
+      required:
+        - email
+      properties:
+        email:
+          type: string
+          format: email
+          example: user@example.com
+
+    CreateUserResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        email:
+          type: string
+          example: user@example.com
+        api_key:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+        status:
+          type: string
+          example: active
+
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 1
+        email:
+          type: string
+          example: user@example.com
+        status:
+          type: string
+          example: active
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-06-17T18:00:00Z'
+
+    UUIDResponse:
+      type: object
+      properties:
+        uuid:
+          type: string
+          example: 550e8400-e29b-41d4-a716-446655440000
+        user_id:
+          type: integer
+          format: int64
+          example: 1
+        email:
+          type: string
+          example: user@example.com
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-06-17T18:00:00Z'
