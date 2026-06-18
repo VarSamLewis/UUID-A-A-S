@@ -591,7 +591,6 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	collisions := 0
 	var u string
 	for i := 0; i < 5; i++ {
 		u = uuid.Must(uuid.NewV7()).String()
@@ -603,19 +602,23 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to store UUID")
 			return
 		}
-		collisions++
+		// First collision - record it and return the fun message
+		if i == 0 {
+			if err := db.CreateCollisionRecord(user.ID); err != nil {
+				slog.Error("failed to record collision", "error", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"message": "🎉 Congrats!!! You generated a duplicate UUID. The chances of that are approximately 1 in 2^122. You should buy a lottery ticket!",
+				"uuid":    "",
+			})
+			return
+		}
 		slog.Warn("uuid collision, retrying", "attempt", i+1)
 	}
 	if err != nil {
-		if err := db.CreateCollisionRecord(user.ID); err != nil {
-			slog.Error("failed to record collision", "error", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"message": "🎉 Congrats!!! You generated a duplicate UUID 5 times in a row. The chances of that are approximately 1 in 10^183. You should buy a lottery ticket!",
-			"uuid":    "",
-		})
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to generate unique UUID after retries")
 		return
 	}
 
