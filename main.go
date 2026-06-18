@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,19 +20,58 @@ import (
 	"github.com/joho/godotenv"
 )
 
-const maxBodySize = 1 * 1024 * 1024 // 1MB
+const (
+	maxBodySize         = 1 * 1024 * 1024 // 1MB
+	defaultPort         = "8080"
+	defaultReadTimeout  = 10 * time.Second
+	defaultWriteTimeout = 10 * time.Second
+	defaultIdleTimeout  = 120 * time.Second
+	shutdownTimeout     = 10 * time.Second
 
-var db *DB
+	// Rate limits
+	signupLimit     = 3
+	signupWindow    = time.Hour
+	uuidLimit       = 100
+	uuidWindow      = time.Minute
+	loginFailLimit  = 10
+	loginFailWindow = time.Minute
+	healthLimit     = 60
+	healthWindow    = time.Minute
+	metricsLimit    = 30
+	metricsWindow   = time.Minute
+	userGetLimit    = 100
+	userGetWindow   = time.Minute
+	globalIPLimit   = 1000
+	globalIPWindow  = time.Hour
 
-var rateLimiter = NewRateLimiter()
+	// DB connection pool
+	dbMaxOpenConns    = 25
+	dbMaxIdleConns    = 5
+	dbConnMaxLifetime = 5 * time.Minute
 
-var (
-	requestCount    atomic.Uint64
-	requestErrors   atomic.Uint64
-	requestDuration atomic.Uint64
+	// Retry config
+	uuidCollisionRetries = 5
+	dbConnectRetries     = 5
 )
 
 var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+
+type Server struct {
+	db              *DB
+	rateLimiter     *RateLimiter
+	adminKey        string
+	requestCount    atomic.Uint64
+	requestErrors   atomic.Uint64
+	requestDuration atomic.Uint64 // nanoseconds
+}
+
+func NewServer(db *DB) *Server {
+	return &Server{
+		db:          db,
+		rateLimiter: NewRateLimiter(),
+		adminKey:    os.Getenv("ADMIN_API_KEY"),
+	}
+}
 
 type RateLimiter struct {
 	mu      sync.RWMutex
@@ -145,13 +186,10 @@ func getIP(r *http.Request) string {
 	if ip == "" {
 		ip = r.RemoteAddr
 	}
-	if idx := len(ip) - 1; idx > 0 {
-		for i := idx; i >= 0; i-- {
-			if ip[i] == ':' {
-				ip = ip[:i]
-				break
-			}
-		}
+	// Handle IPv4:port and IPv6 [addr]:port
+	host, _, err := net.SplitHostPort(ip)
+	if err == nil {
+		return host
 	}
 	return ip
 }
@@ -161,6 +199,10 @@ func extractBearerToken(authHeader string) string {
 		return authHeader[7:]
 	}
 	return ""
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 func isValidEmail(email string) bool {
@@ -184,62 +226,70 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	})
 }
 
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
 func main() {
 	godotenv.Load()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	if err := runServer(); err != nil {
+	if err := run(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func runServer() error {
-	var err error
-
-	db, err = InitDB()
+func run() error {
+	db, err := InitDB()
 	if err != nil {
 		return fmt.Errorf("failed to init DB: %w", err)
 	}
+	defer db.Close()
 
+	srv := NewServer(db)
+	return srv.runServer()
+}
+
+func (s *Server) runServer() error {
 	mux := http.NewServeMux()
 
-	// Static files
-	fs := http.FileServer(http.Dir("static"))
-	mux.Handle("/", fs)
-	mux.Handle("/privacy.html", fs)
-	mux.Handle("/openapi.yaml", http.FileServer(http.Dir(".")))
+	// Static files - only serve specific files
+	mux.HandleFunc("GET /{$}", s.serveStatic("static/index.html"))
+	mux.HandleFunc("GET /privacy.html", s.serveStatic("static/privacy.html"))
+	mux.HandleFunc("GET /openapi.yaml", s.serveStatic("openapi.yaml"))
 
 	// API routes
-	mux.HandleFunc("GET /health", rateLimitHandler(healthHandler, "health", 60, time.Minute))
-	mux.HandleFunc("GET /metrics", adminAuth(rateLimitHandler(metricsHandler, "metrics", 30, time.Minute)))
-	mux.HandleFunc("POST /v1/signup", rateLimitHandler(bodyLimitHandler(signupHandler), "signup", 3, time.Hour))
-	mux.HandleFunc("GET /v1/users/{id}", rateLimitHandler(getUserHandler, "user", 100, time.Minute))
-	mux.HandleFunc("POST /v1/login", rateLimitFailedLogin(bodyLimitHandler(loginHandler)))
-	mux.HandleFunc("POST /v1/uuid", rateLimitByAPIKey(bodyLimitHandler(generateUUIDHandler), "uuid", 100, time.Minute))
+	mux.HandleFunc("GET /health", s.rateLimit(s.healthHandler, "health", healthLimit, healthWindow))
+	mux.HandleFunc("GET /metrics", s.adminAuth(s.rateLimit(s.metricsHandler, "metrics", metricsLimit, metricsWindow)))
+	mux.HandleFunc("POST /v1/signup", s.rateLimit(s.bodyLimit(s.signupHandler), "signup", signupLimit, signupWindow))
+	mux.HandleFunc("GET /v1/users/{id}", s.rateLimit(s.getUserHandler, "user", userGetLimit, userGetWindow))
+	mux.HandleFunc("POST /v1/login", s.rateLimitFailedLogin(s.bodyLimit(s.loginHandler)))
+	mux.HandleFunc("POST /v1/uuid", s.rateLimitByAPIKey(s.bodyLimit(s.generateUUIDHandler), "uuid", uuidLimit, uuidWindow))
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = defaultPort
 	}
 
-	// Apply global rate limit + logging to everything
-	wrapped := loggingMiddleware(globalRateLimit(mux))
+	wrapped := s.loggingMiddleware(s.globalRateLimit(mux))
 
-	srv := &http.Server{
+	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      wrapped,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  defaultReadTimeout,
+		WriteTimeout: defaultWriteTimeout,
+		IdleTimeout:  defaultIdleTimeout,
 	}
 
-	slog.Info("server starting", "addr", srv.Addr)
+	slog.Info("server starting", "addr", server.Addr)
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("listen error", "error", err)
 		}
 	}()
@@ -250,13 +300,19 @@ func runServer() error {
 
 	slog.Info("server shutting down")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	return srv.Shutdown(ctx)
+	return server.Shutdown(ctx)
 }
 
-func loggingMiddleware(next http.Handler) http.Handler {
+func (s *Server) serveStatic(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, path)
+	}
+}
+
+func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		reqID := uuid.New().String()
@@ -268,10 +324,10 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 
 		duration := time.Since(start)
-		requestCount.Add(1)
-		requestDuration.Add(uint64(duration.Nanoseconds()))
+		s.requestCount.Add(1)
+		s.requestDuration.Add(uint64(duration.Nanoseconds()))
 		if rw.statusCode >= 400 {
-			requestErrors.Add(1)
+			s.requestErrors.Add(1)
 		}
 
 		slog.Info("request",
@@ -285,12 +341,11 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Global per-IP rate limit: 1000 requests/hour across all endpoints
-func globalRateLimit(next http.Handler) http.Handler {
+func (s *Server) globalRateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := getIP(r)
 		key := ip + ":global"
-		if !rateLimiter.checkLimit(key, 1000, time.Hour) {
+		if !s.rateLimiter.checkLimit(key, globalIPLimit, globalIPWindow) {
 			writeError(w, http.StatusTooManyRequests, "global_rate_limit_exceeded", "Too many requests from this IP. Please try again later.")
 			return
 		}
@@ -298,25 +353,22 @@ func globalRateLimit(next http.Handler) http.Handler {
 	})
 }
 
-// Body size limit middleware
-func bodyLimitHandler(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) bodyLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 		next(w, r)
 	}
 }
 
-// Admin auth middleware for sensitive endpoints
-func adminAuth(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		adminKey := os.Getenv("ADMIN_API_KEY")
-		if adminKey == "" {
+		if s.adminKey == "" {
 			writeError(w, http.StatusServiceUnavailable, "admin_not_configured", "Admin access is not configured")
 			return
 		}
 
 		authHeader := r.Header.Get("Authorization")
-		if authHeader != "Bearer "+adminKey {
+		if authHeader != "Bearer "+s.adminKey {
 			writeError(w, http.StatusUnauthorized, "admin_required", "Admin authentication required")
 			return
 		}
@@ -324,10 +376,10 @@ func adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func rateLimitHandler(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
+func (s *Server) rateLimit(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := getIP(r) + ":" + limitKey
-		if !rateLimiter.checkLimit(key, maxRequests, windowDuration) {
+		if !s.rateLimiter.checkLimit(key, maxRequests, windowDuration) {
 			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.")
 			return
 		}
@@ -335,7 +387,7 @@ func rateLimitHandler(next http.HandlerFunc, limitKey string, maxRequests int, w
 	}
 }
 
-func rateLimitByAPIKey(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
+func (s *Server) rateLimitByAPIKey(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		apiKey := extractBearerToken(r.Header.Get("Authorization"))
 		if apiKey == "" {
@@ -347,7 +399,7 @@ func rateLimitByAPIKey(next http.HandlerFunc, limitKey string, maxRequests int, 
 			return
 		}
 		key := "apikey:" + apiKey + ":" + limitKey
-		if !rateLimiter.checkLimit(key, maxRequests, windowDuration) {
+		if !s.rateLimiter.checkLimit(key, maxRequests, windowDuration) {
 			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.")
 			return
 		}
@@ -355,12 +407,12 @@ func rateLimitByAPIKey(next http.HandlerFunc, limitKey string, maxRequests int, 
 	}
 }
 
-func rateLimitFailedLogin(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) rateLimitFailedLogin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := getIP(r)
 		failedKey := ip + ":failed_login"
 
-		if rateLimiter.isBlocked(failedKey) {
+		if s.rateLimiter.isBlocked(failedKey) {
 			writeError(w, http.StatusTooManyRequests, "too_many_failed_logins", "Too many failed login attempts. Please try again later.")
 			return
 		}
@@ -369,7 +421,7 @@ func rateLimitFailedLogin(next http.HandlerFunc) http.HandlerFunc {
 		next(rw, r)
 
 		if rw.statusCode == http.StatusUnauthorized {
-			rateLimiter.increment(failedKey, 10, time.Minute)
+			s.rateLimiter.increment(failedKey, loginFailLimit, loginFailWindow)
 		}
 	}
 }
@@ -382,6 +434,10 @@ type statusRecorder struct {
 func (sr *statusRecorder) WriteHeader(code int) {
 	sr.statusCode = code
 	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Unwrap() http.ResponseWriter {
+	return sr.ResponseWriter
 }
 
 type CreateUserRequest struct {
@@ -409,51 +465,58 @@ type UUIDResponse struct {
 	Timestamp string `json:"timestamp"`
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
-}
+func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	count := requestCount.Load()
-	var avgDuration float64
-	if count > 0 {
-		avgDuration = float64(requestDuration.Load()) / float64(count) / 1e6
+	if err := s.db.PingContext(ctx); err != nil {
+		slog.Error("health check db ping failed", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "unhealthy", "Database connection failed")
+		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]string{"status": "healthy"})
+}
+
+func (s *Server) metricsHandler(w http.ResponseWriter, r *http.Request) {
+	count := s.requestCount.Load()
+	var avgDuration float64
+	if count > 0 {
+		avgDuration = float64(s.requestDuration.Load()) / float64(count) / 1e6
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"requests_total":  count,
-		"requests_errors": requestErrors.Load(),
+		"requests_errors": s.requestErrors.Load(),
 		"avg_duration_ms": avgDuration,
 	})
 }
 
-func signupHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) signupHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON in request body")
 		return
 	}
 
-	if req.Email == "" {
+	email := normalizeEmail(req.Email)
+	if email == "" {
 		writeError(w, http.StatusBadRequest, "email_required", "Email is required")
 		return
 	}
 
-	if !isValidEmail(req.Email) {
+	if !isValidEmail(email) {
 		writeError(w, http.StatusBadRequest, "invalid_email", "Invalid email format")
 		return
 	}
 
-	if len(req.Email) > 254 {
+	if len(email) > 254 {
 		writeError(w, http.StatusBadRequest, "email_too_long", "Email must be less than 254 characters")
 		return
 	}
 
 	plaintextKey := uuid.New().String()
-	id, err := db.CreateUser(req.Email, plaintextKey)
+	id, err := s.db.CreateUser(r.Context(), email, plaintextKey)
 	if err != nil {
 		if dbErr, ok := err.(DBError); ok {
 			if dbErr.Code == "email_exists" {
@@ -465,7 +528,7 @@ func signupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := db.GetUserByID(id)
+	user, err := s.db.GetUserByID(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve user")
 		return
@@ -478,12 +541,10 @@ func signupHandler(w http.ResponseWriter, r *http.Request) {
 		Status: user.Status,
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func getUserHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) getUserHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	apiKey := extractBearerToken(authHeader)
 
@@ -497,7 +558,7 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := db.GetUserByAPIKey(apiKey)
+	user, err := s.db.GetUserByAPIKey(r.Context(), apiKey)
 	if err != nil {
 		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
 			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
@@ -526,12 +587,10 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: user.CreatedAt.Format(time.RFC3339),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) loginHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	apiKey := extractBearerToken(authHeader)
 
@@ -545,7 +604,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := db.GetUserByAPIKey(apiKey)
+	user, err := s.db.GetUserByAPIKey(r.Context(), apiKey)
 	if err != nil {
 		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
 			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
@@ -562,12 +621,10 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: user.CreatedAt.Format(time.RFC3339),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 	authHeader := r.Header.Get("Authorization")
 	apiKey := extractBearerToken(authHeader)
 
@@ -581,7 +638,7 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := db.GetUserByAPIKey(apiKey)
+	user, err := s.db.GetUserByAPIKey(r.Context(), apiKey)
 	if err != nil {
 		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
 			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
@@ -592,9 +649,15 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var u string
-	for i := 0; i < 5; i++ {
-		u = uuid.Must(uuid.NewV7()).String()
-		err = db.CreateUUIDRecord(u, user.ID)
+	for i := 0; i < uuidCollisionRetries; i++ {
+		newUUID, err := uuid.NewV7()
+		if err != nil {
+			slog.Error("failed to generate uuid", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to generate UUID")
+			return
+		}
+		u = newUUID.String()
+		err = s.db.CreateUUIDRecord(r.Context(), u, user.ID)
 		if err == nil {
 			break
 		}
@@ -604,12 +667,10 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		// First collision - record it and return the fun message
 		if i == 0 {
-			if err := db.CreateCollisionRecord(user.ID); err != nil {
+			if err := s.db.CreateCollisionRecord(r.Context(), user.ID); err != nil {
 				slog.Error("failed to record collision", "error", err)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(map[string]string{
+			writeJSON(w, http.StatusOK, map[string]string{
 				"message": "Congrats!!! You generated a duplicate UUID. The chances of that are approximately 1 in 2^122. You should buy a lottery ticket!",
 				"uuid":    "",
 			})
@@ -629,7 +690,5 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, http.StatusOK, resp)
 }
