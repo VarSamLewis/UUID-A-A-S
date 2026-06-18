@@ -18,6 +18,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const maxBodySize = 1 * 1024 * 1024 // 1MB
+
 var db *DB
 
 var rateLimiter = NewRateLimiter()
@@ -211,19 +213,20 @@ func runServer() error {
 	mux.Handle("/openapi.yaml", http.FileServer(http.Dir(".")))
 
 	// API routes
-	mux.HandleFunc("GET /health", healthHandler)
-	mux.HandleFunc("GET /metrics", metricsHandler)
-	mux.HandleFunc("POST /v1/signup", rateLimitHandler(signupHandler, "signup", 3, time.Hour))
-	mux.HandleFunc("GET /v1/users/{id}", getUserHandler)
-	mux.HandleFunc("POST /v1/login", rateLimitFailedLogin(loginHandler))
-	mux.HandleFunc("POST /v1/uuid", rateLimitByAPIKey(generateUUIDHandler, "uuid", 100, time.Minute))
+	mux.HandleFunc("GET /health", rateLimitHandler(healthHandler, "health", 60, time.Minute))
+	mux.HandleFunc("GET /metrics", adminAuth(rateLimitHandler(metricsHandler, "metrics", 30, time.Minute)))
+	mux.HandleFunc("POST /v1/signup", rateLimitHandler(bodyLimitHandler(signupHandler), "signup", 3, time.Hour))
+	mux.HandleFunc("GET /v1/users/{id}", rateLimitHandler(getUserHandler, "user", 100, time.Minute))
+	mux.HandleFunc("POST /v1/login", rateLimitFailedLogin(bodyLimitHandler(loginHandler)))
+	mux.HandleFunc("POST /v1/uuid", rateLimitByAPIKey(bodyLimitHandler(generateUUIDHandler), "uuid", 100, time.Minute))
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	wrapped := loggingMiddleware(mux)
+	// Apply global rate limit + logging to everything
+	wrapped := loggingMiddleware(globalRateLimit(mux))
 
 	srv := &http.Server{
 		Addr:         ":" + port,
@@ -280,6 +283,46 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			"ip", getIP(r),
 		)
 	})
+}
+
+// Global per-IP rate limit: 1000 requests/hour across all endpoints
+func globalRateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := getIP(r)
+		key := ip + ":global"
+		if !rateLimiter.checkLimit(key, 1000, time.Hour) {
+			writeError(w, http.StatusTooManyRequests, "global_rate_limit_exceeded", "Too many requests from this IP. Please try again later.")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Body size limit middleware
+func bodyLimitHandler(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next(w, r)
+	}
+}
+
+// Admin auth middleware for sensitive endpoints
+func adminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		adminKey := os.Getenv("ADMIN_API_KEY")
+		if adminKey == "" {
+			// If no admin key is set, allow access (for dev convenience)
+			next(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "Bearer "+adminKey {
+			writeError(w, http.StatusUnauthorized, "admin_required", "Admin authentication required")
+			return
+		}
+		next(w, r)
+	}
 }
 
 func rateLimitHandler(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
