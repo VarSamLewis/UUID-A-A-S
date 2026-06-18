@@ -102,6 +102,13 @@ func createTables(db *sql.DB) error {
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS collisions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		collision_ts TEXT NOT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
 	CREATE INDEX IF NOT EXISTS idx_uuids_user_id ON uuids(user_id);
 	`
@@ -181,6 +188,15 @@ func (db *DB) CreateUUIDRecord(uuid string, userID int64) error {
 		return parseDBError(err)
 	}
 	return nil
+}
+
+func (db *DB) CreateCollisionRecord(userID int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.Exec(
+		"INSERT INTO collisions (user_id, collision_ts) VALUES (?, ?)",
+		userID, now,
+	)
+	return err
 }
 
 func hashAPIKey(key string) string {
