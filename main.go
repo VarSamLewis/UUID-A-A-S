@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -19,15 +20,15 @@ import (
 
 var db *DB
 
-// Rate limiting state
 var rateLimiter = NewRateLimiter()
 
-// Metrics state
 var (
 	requestCount    atomic.Uint64
 	requestErrors   atomic.Uint64
-	requestDuration atomic.Uint64 // nanoseconds
+	requestDuration atomic.Uint64
 )
+
+var emailRegex = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 
 type RateLimiter struct {
 	mu      sync.RWMutex
@@ -160,6 +161,27 @@ func extractBearerToken(authHeader string) string {
 	return ""
 }
 
+func isValidEmail(email string) bool {
+	if len(email) < 3 || len(email) > 254 {
+		return false
+	}
+	return emailRegex.MatchString(email)
+}
+
+func isValidAPIKey(key string) bool {
+	_, err := uuid.Parse(key)
+	return err == nil
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error":   code,
+		"message": message,
+	})
+}
+
 func main() {
 	godotenv.Load()
 
@@ -252,43 +274,44 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// IP-based rate limiting (for signup, failed login)
 func rateLimitHandler(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := getIP(r) + ":" + limitKey
 		if !rateLimiter.checkLimit(key, maxRequests, windowDuration) {
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.")
 			return
 		}
 		next(w, r)
 	}
 }
 
-// API key-based rate limiting (for UUID generation)
 func rateLimitByAPIKey(next http.HandlerFunc, limitKey string, maxRequests int, windowDuration time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		apiKey := extractBearerToken(r.Header.Get("Authorization"))
 		if apiKey == "" {
-			http.Error(w, "Authorization required", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "authorization_required", "Authorization header is required")
+			return
+		}
+		if !isValidAPIKey(apiKey) {
+			writeError(w, http.StatusUnauthorized, "invalid_api_key_format", "Invalid API key format")
 			return
 		}
 		key := "apikey:" + apiKey + ":" + limitKey
 		if !rateLimiter.checkLimit(key, maxRequests, windowDuration) {
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "Rate limit exceeded. Please try again later.")
 			return
 		}
 		next(w, r)
 	}
 }
 
-// Rate limit failed login attempts (per IP)
 func rateLimitFailedLogin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := getIP(r)
 		failedKey := ip + ":failed_login"
 
 		if rateLimiter.isBlocked(failedKey) {
-			http.Error(w, "Too many failed login attempts", http.StatusTooManyRequests)
+			writeError(w, http.StatusTooManyRequests, "too_many_failed_logins", "Too many failed login attempts. Please try again later.")
 			return
 		}
 
@@ -346,7 +369,7 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	count := requestCount.Load()
 	var avgDuration float64
 	if count > 0 {
-		avgDuration = float64(requestDuration.Load()) / float64(count) / 1e6 // ms
+		avgDuration = float64(requestDuration.Load()) / float64(count) / 1e6
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -360,25 +383,41 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 func signupHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateUserRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_json", "Invalid JSON in request body")
 		return
 	}
 
 	if req.Email == "" {
-		http.Error(w, "Email is required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "email_required", "Email is required")
+		return
+	}
+
+	if !isValidEmail(req.Email) {
+		writeError(w, http.StatusBadRequest, "invalid_email", "Invalid email format")
+		return
+	}
+
+	if len(req.Email) > 254 {
+		writeError(w, http.StatusBadRequest, "email_too_long", "Email must be less than 254 characters")
 		return
 	}
 
 	plaintextKey := uuid.New().String()
 	id, err := db.CreateUser(req.Email, plaintextKey)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if dbErr, ok := err.(DBError); ok {
+			if dbErr.Code == "email_exists" {
+				writeError(w, http.StatusConflict, dbErr.Code, dbErr.Message)
+				return
+			}
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create user")
 		return
 	}
 
 	user, err := db.GetUserByID(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve user")
 		return
 	}
 
@@ -390,6 +429,7 @@ func signupHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
 
@@ -398,25 +438,34 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractBearerToken(authHeader)
 
 	if apiKey == "" {
-		http.Error(w, "Authorization required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "authorization_required", "Authorization header is required")
+		return
+	}
+
+	if !isValidAPIKey(apiKey) {
+		writeError(w, http.StatusUnauthorized, "invalid_api_key_format", "Invalid API key format")
 		return
 	}
 
 	user, err := db.GetUserByAPIKey(apiKey)
 	if err != nil {
-		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
+			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve user")
 		return
 	}
 
 	idStr := r.PathValue("id")
 	var id int64
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid_user_id", "Invalid user ID format")
 		return
 	}
 
 	if user.ID != id {
-		http.Error(w, "Not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "user_not_found", "User not found")
 		return
 	}
 
@@ -428,6 +477,7 @@ func getUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
 
@@ -436,13 +486,22 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractBearerToken(authHeader)
 
 	if apiKey == "" {
-		http.Error(w, "Authorization required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "authorization_required", "Authorization header is required")
+		return
+	}
+
+	if !isValidAPIKey(apiKey) {
+		writeError(w, http.StatusUnauthorized, "invalid_api_key_format", "Invalid API key format")
 		return
 	}
 
 	user, err := db.GetUserByAPIKey(apiKey)
 	if err != nil {
-		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
+			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to authenticate")
 		return
 	}
 
@@ -454,6 +513,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
 
@@ -462,20 +522,29 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 	apiKey := extractBearerToken(authHeader)
 
 	if apiKey == "" {
-		http.Error(w, "Authorization required", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "authorization_required", "Authorization header is required")
+		return
+	}
+
+	if !isValidAPIKey(apiKey) {
+		writeError(w, http.StatusUnauthorized, "invalid_api_key_format", "Invalid API key format")
 		return
 	}
 
 	user, err := db.GetUserByAPIKey(apiKey)
 	if err != nil {
-		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		if dbErr, ok := err.(DBError); ok && dbErr.Code == "invalid_api_key" {
+			writeError(w, http.StatusUnauthorized, dbErr.Code, dbErr.Message)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to authenticate")
 		return
 	}
 
 	u := uuid.New().String()
 
 	if err := db.CreateUUIDRecord(u, user.ID); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to store UUID")
 		return
 	}
 
@@ -487,5 +556,6 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }

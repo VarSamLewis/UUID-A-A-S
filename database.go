@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
@@ -14,6 +16,31 @@ import (
 
 type DB struct {
 	*sql.DB
+}
+
+type DBError struct {
+	Code    string
+	Message string
+}
+
+func (e DBError) Error() string {
+	return e.Message
+}
+
+func parseDBError(err error) error {
+	if err == nil {
+		return nil
+	}
+	errStr := err.Error()
+
+	if strings.Contains(errStr, "UNIQUE constraint failed: users.email") {
+		return DBError{Code: "email_exists", Message: "An account with this email already exists"}
+	}
+	if strings.Contains(errStr, "UNIQUE constraint failed: uuids.uuid") {
+		return DBError{Code: "uuid_exists", Message: "This UUID already exists"}
+	}
+
+	return DBError{Code: "internal_error", Message: "Database error"}
 }
 
 func InitDB() (*DB, error) {
@@ -30,7 +57,6 @@ func InitDB() (*DB, error) {
 	var db *sql.DB
 	var err error
 
-	// Retry connection with exponential backoff
 	for attempt := 1; attempt <= 5; attempt++ {
 		db, err = sql.Open("libsql", tursoURL)
 		if err == nil {
@@ -46,7 +72,6 @@ func InitDB() (*DB, error) {
 		return nil, fmt.Errorf("failed to connect to libsql database after retries: %w", err)
 	}
 
-	// Connection pooling
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -103,7 +128,7 @@ func (db *DB) CreateUser(email, apiKey string) (int64, error) {
 		email, keyHash, "active", now, now,
 	)
 	if err != nil {
-		return 0, err
+		return 0, parseDBError(err)
 	}
 	return result.LastInsertId()
 }
@@ -116,7 +141,10 @@ func (db *DB) GetUserByID(id int64) (*User, error) {
 		id,
 	).Scan(&user.ID, &user.Email, &user.APIKey, &user.Status, &createdAt, &updatedAt)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, DBError{Code: "user_not_found", Message: "User not found"}
+		}
+		return nil, parseDBError(err)
 	}
 	user.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	user.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -133,7 +161,10 @@ func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
 		keyHash,
 	).Scan(&user.ID, &user.Email, &user.APIKey, &user.Status, &createdAt, &updatedAt)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, DBError{Code: "invalid_api_key", Message: "Invalid or inactive API key"}
+		}
+		return nil, parseDBError(err)
 	}
 	user.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	user.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -146,7 +177,10 @@ func (db *DB) CreateUUIDRecord(uuid string, userID int64) error {
 		"INSERT INTO uuids (uuid, user_id, created_at) VALUES (?, ?, ?)",
 		uuid, userID, now,
 	)
-	return err
+	if err != nil {
+		return parseDBError(err)
+	}
+	return nil
 }
 
 func hashAPIKey(key string) string {
