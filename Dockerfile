@@ -18,6 +18,8 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /app
 
 COPY --from=builder /app/uuid_service .
+COPY --from=builder /app/static ./static
+COPY --from=builder /app/openapi.yaml ./openapi.yaml
 
 RUN adduser -D -u 1000 appuser
 USER appuser
