@@ -311,8 +311,7 @@ func adminAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		adminKey := os.Getenv("ADMIN_API_KEY")
 		if adminKey == "" {
-			// If no admin key is set, allow access (for dev convenience)
-			next(w, r)
+			writeError(w, http.StatusServiceUnavailable, "admin_not_configured", "Admin access is not configured")
 			return
 		}
 
@@ -592,10 +591,21 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := uuid.New().String()
-
-	if err := db.CreateUUIDRecord(u, user.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to store UUID")
+	var u string
+	for i := 0; i < 5; i++ {
+		u = uuid.Must(uuid.NewV7()).String()
+		err = db.CreateUUIDRecord(u, user.ID)
+		if err == nil {
+			break
+		}
+		if dbErr, ok := err.(DBError); !ok || dbErr.Code != "uuid_exists" {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to store UUID")
+			return
+		}
+		slog.Warn("uuid collision, retrying", "attempt", i+1)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to generate unique UUID after retries")
 		return
 	}
 
