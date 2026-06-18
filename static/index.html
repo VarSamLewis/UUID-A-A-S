@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UUID as a Service - Enterprise UUID Generation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        header {
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            position: fixed;
+            width: 100%;
+            top: 0;
+            z-index: 1000;
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+        }
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+        .nav-links a {
+            margin-left: 2rem;
+            text-decoration: none;
+            color: #555;
+            font-weight: 500;
+        }
+        .nav-links a:hover { color: #667eea; }
+        
+        .hero {
+            padding: 150px 0 100px;
+            text-align: center;
+            color: white;
+        }
+        .hero h1 {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .hero .subtitle {
+            font-size: 1.5rem;
+            margin-bottom: 2rem;
+            opacity: 0.9;
+        }
+        .hero .joke-text {
+            font-size: 1.1rem;
+            opacity: 0.8;
+            margin-bottom: 3rem;
+            font-style: italic;
+        }
+        .cta-button {
+            display: inline-block;
+            padding: 15px 40px;
+            background: white;
+            color: #667eea;
+            text-decoration: none;
+            border-radius: 50px;
+            font-weight: bold;
+            font-size: 1.1rem;
+            transition: transform 0.3s, box-shadow 0.3s;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        .cta-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        
+        .features {
+            background: white;
+            padding: 80px 0;
+        }
+        .features h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+            color: #333;
+        }
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+        .feature-card {
+            padding: 2rem;
+            border-radius: 10px;
+            background: #f8f9fa;
+            text-align: center;
+            transition: transform 0.3s;
+        }
+        .feature-card:hover {
+            transform: translateY(-5px);
+        }
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        .feature-card h3 {
+            margin-bottom: 1rem;
+            color: #667eea;
+        }
+        
+        .testimonials {
+            background: #f8f9fa;
+            padding: 80px 0;
+        }
+        .testimonials h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+        }
+        .testimonial-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+        .testimonial-card {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .testimonial-card p {
+            font-style: italic;
+            margin-bottom: 1rem;
+        }
+        .testimonial-card .author {
+            font-weight: bold;
+            color: #667eea;
+        }
+        .testimonial-card .role {
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
+        .pricing {
+            background: white;
+            padding: 80px 0;
+        }
+        .pricing h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+        }
+        .pricing-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 2rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        .pricing-card {
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 2rem;
+            text-align: center;
+        }
+        .pricing-card.featured {
+            border-color: #667eea;
+            transform: scale(1.05);
+        }
+        .pricing-card h3 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .price {
+            font-size: 3rem;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 1rem;
+        }
+        .price span {
+            font-size: 1rem;
+            color: #666;
+        }
+        .pricing-card ul {
+            list-style: none;
+            margin: 2rem 0;
+        }
+        .pricing-card li {
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .api-demo {
+            background: #1a1a2e;
+            color: white;
+            padding: 80px 0;
+        }
+        .api-demo h2 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+        }
+        .code-block {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 2rem;
+            max-width: 700px;
+            margin: 0 auto;
+            overflow-x: auto;
+        }
+        .code-block pre {
+            margin: 0;
+            font-family: 'Courier New', monospace;
+            line-height: 1.8;
+        }
+        .code-block .comment { color: #6a9955; }
+        .code-block .command { color: #ce9178; }
+        
+        footer {
+            background: #333;
+            color: white;
+            text-align: center;
+            padding: 2rem 0;
+        }
+        footer a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        
+        @media (max-width: 768px) {
+            .hero h1 { font-size: 2.5rem; }
+            .hero .subtitle { font-size: 1.2rem; }
+            .pricing-card.featured { transform: none; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <nav class="container">
+            <div class="logo">🔑 UUIDaaS</div>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#pricing">Pricing</a>
+                <a href="#api">API</a>
+                <a href="/privacy.html">Privacy</a>
+            </div>
+        </nav>
+    </header>
+
+    <section class="hero">
+        <div class="container">
+            <h1>UUID as a Service</h1>
+            <p class="subtitle">Enterprise-Grade UUID Generation in the Cloud</p>
+            <p class="joke-text">Because apparently `uuidgen` wasn't good enough for you</p>
+            <a href="#api" class="cta-button">Get Started for Free*</a>
+            <p style="margin-top: 1rem; font-size: 0.8rem; opacity: 0.6;">* Free until you read the pricing section</p>
+        </div>
+    </section>
+
+    <section class="features" id="features">
+        <div class="container">
+            <h2>Why Choose UUIDaaS?</h2>
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Webscale UUIDs</h3>
+                    <p>Our UUIDs are generated using state-of-the-art random number generators that are definitely better than whatever you're using.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔒</div>
+                    <h3>UUIDs Stored Forever</h3>
+                    <p>Every UUID you generate is stored in our database for eternity. You know, just in case you need to look up that UUID you generated at 3am.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3>Rate Limiting</h3>
+                    <p>100 UUIDs per minute. Because if you need more than 100 UUIDs per minute, you might be doing something wrong.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🎯</div>
+                    <h3>99.99% Uptime</h3>
+                    <p>Our service has a 99.99% uptime SLA. The other 0.01% is when we're generating UUIDs for ourselves.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🚀</div>
+                    <h3>REST API</h3>
+                    <p>A fully RESTful API with JSON responses. Because XML is dead and GraphQL is too complicated for UUIDs.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💼</div>
+                    <h3>Enterprise Ready</h3>
+                    <p>Used by literally dozens of developers who forgot they have `uuidgen` installed.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="testimonials">
+        <div class="container">
+            <h2>What Our Users Say</h2>
+            <div class="testimonial-grid">
+                <div class="testimonial-card">
+                    <p>"UUIDaaS changed my life. Before, I was generating UUIDs locally like a caveman. Now I make HTTP requests like a civilized person."</p>
+                    <div class="author">Alex Developer</div>
+                    <div class="role">Senior Copy-Paste Engineer at StartupCo</div>
+                </div>
+                <div class="testimonial-card">
+                    <p>"We migrated our entire UUID generation infrastructure to UUIDaaS. Our AWS bill went up 400% but our UUIDs are now webscale."</p>
+                    <div class="author">Jordan Architect</div>
+                    <div class="role">Cloud Migration Specialist</div>
+                </div>
+                <div class="testimonial-card">
+                    <p>"I was skeptical at first. Why would I need a service to generate UUIDs? Then I realized I could put it on my resume as 'microservices experience'."</p>
+                    <div class="author">Taylor Engineer</div>
+                    <div class="role">Full Stack Overflow Developer</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="pricing" id="pricing">
+        <div class="container">
+            <h2>Pricing</h2>
+            <div class="pricing-grid">
+                <div class="pricing-card">
+                    <h3>Hobby</h3>
+                    <div class="price">$0<span>/month</span></div>
+                    <ul>
+                        <li>100 UUIDs/minute</li>
+                        <li>3 signups/hour</li>
+                        <li>Your UUIDs stored forever</li>
+                        <li>No support</li>
+                        <li>We're judging your UUID usage</li>
+                    </ul>
+                    <a href="#api" class="cta-button" style="font-size: 0.9rem;">Start Generating</a>
+                </div>
+                <div class="pricing-card featured">
+                    <h3>Pro</h3>
+                    <div class="price">$49<span>/month</span></div>
+                    <ul>
+                        <li>Same as Hobby</li>
+                        <li>But we charge you</li>
+                        <li>A fancy dashboard (coming soon)</li>
+                        <li>Priority UUID generation</li>
+                        <li>We'll pretend to care about your issues</li>
+                    </ul>
+                    <a href="#api" class="cta-button" style="font-size: 0.9rem;">Upgrade to Pro</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="api-demo" id="api">
+        <div class="container">
+            <h2>API</h2>
+            <div class="code-block">
+                <pre><span class="comment"># Sign up (because you need an account to generate UUIDs)</span>
+<span class="command">curl -X POST https://uuid-a-a-s-production.up.railway.app/v1/signup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com"}'</span>
+
+<span class="comment"># Generate a UUID (the moment you've been waiting for)</span>
+<span class="command">curl -X POST https://uuid-a-a-s-production.up.railway.app/v1/uuid \
+  -H "Authorization: Bearer YOUR_API_KEY"</span>
+
+<span class="comment"># Check if you're still alive</span>
+<span class="command">curl https://uuid-a-a-s-production.up.railway.app/health</span></pre>
+            </div>
+            <p style="text-align: center; margin-top: 2rem; opacity: 0.7;">
+                Full API documentation available at <a href="/openapi.yaml" style="color: #667eea;">openapi.yaml</a>
+            </p>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p> UUIDaaS. All rights reserved. UUIDs generated: probably millions.</p>
+            <p>Built with Go, Turso, and an unhealthy obsession with over-engineering.</p>
+            <p><a href="/privacy.html">Privacy Policy</a> | <a href="/openapi.yaml">API Spec</a></p>
+        </div>
+    </footer>
+</body>
+</html>

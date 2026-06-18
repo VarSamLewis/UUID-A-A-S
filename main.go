@@ -203,6 +203,14 @@ func runServer() error {
 	}
 
 	mux := http.NewServeMux()
+
+	// Static files
+	fs := http.FileServer(http.Dir("static"))
+	mux.Handle("/", fs)
+	mux.Handle("/privacy.html", fs)
+	mux.Handle("/openapi.yaml", http.FileServer(http.Dir(".")))
+
+	// API routes
 	mux.HandleFunc("GET /health", healthHandler)
 	mux.HandleFunc("GET /metrics", metricsHandler)
 	mux.HandleFunc("POST /v1/signup", rateLimitHandler(signupHandler, "signup", 3, time.Hour))
