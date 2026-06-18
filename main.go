@@ -610,7 +610,7 @@ func generateUUIDHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]string{
-				"message": "🎉 Congrats!!! You generated a duplicate UUID. The chances of that are approximately 1 in 2^122. You should buy a lottery ticket!",
+				"message": "Congrats!!! You generated a duplicate UUID. The chances of that are approximately 1 in 2^122. You should buy a lottery ticket!",
 				"uuid":    "",
 			})
 			return
