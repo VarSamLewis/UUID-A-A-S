@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -57,7 +58,7 @@ func InitDB() (*DB, error) {
 	var db *sql.DB
 	var err error
 
-	for attempt := 1; attempt <= 5; attempt++ {
+	for attempt := 1; attempt <= dbConnectRetries; attempt++ {
 		db, err = sql.Open("libsql", tursoURL)
 		if err == nil {
 			err = db.Ping()
@@ -72,9 +73,9 @@ func InitDB() (*DB, error) {
 		return nil, fmt.Errorf("failed to connect to libsql database after retries: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
+	db.SetConnMaxLifetime(dbConnMaxLifetime)
 
 	if err := createTables(db); err != nil {
 		return nil, fmt.Errorf("failed to create tables: %w", err)
@@ -102,6 +103,13 @@ func createTables(db *sql.DB) error {
 		FOREIGN KEY (user_id) REFERENCES users(id)
 	);
 
+	CREATE TABLE IF NOT EXISTS collisions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id INTEGER NOT NULL,
+		collision_ts TEXT NOT NULL,
+		FOREIGN KEY (user_id) REFERENCES users(id)
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
 	CREATE INDEX IF NOT EXISTS idx_uuids_user_id ON uuids(user_id);
 	`
@@ -119,11 +127,11 @@ type User struct {
 	UpdatedAt time.Time
 }
 
-func (db *DB) CreateUser(email, apiKey string) (int64, error) {
+func (db *DB) CreateUser(ctx context.Context, email, apiKey string) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	keyHash := hashAPIKey(apiKey)
 
-	result, err := db.Exec(
+	result, err := db.ExecContext(ctx,
 		"INSERT INTO users (email, api_key, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
 		email, keyHash, "active", now, now,
 	)
@@ -133,10 +141,10 @@ func (db *DB) CreateUser(email, apiKey string) (int64, error) {
 	return result.LastInsertId()
 }
 
-func (db *DB) GetUserByID(id int64) (*User, error) {
+func (db *DB) GetUserByID(ctx context.Context, id int64) (*User, error) {
 	var user User
 	var createdAt, updatedAt string
-	err := db.QueryRow(
+	err := db.QueryRowContext(ctx,
 		"SELECT id, email, api_key, status, created_at, updated_at FROM users WHERE id = ?",
 		id,
 	).Scan(&user.ID, &user.Email, &user.APIKey, &user.Status, &createdAt, &updatedAt)
@@ -151,12 +159,12 @@ func (db *DB) GetUserByID(id int64) (*User, error) {
 	return &user, nil
 }
 
-func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
+func (db *DB) GetUserByAPIKey(ctx context.Context, apiKey string) (*User, error) {
 	keyHash := hashAPIKey(apiKey)
 
 	var user User
 	var createdAt, updatedAt string
-	err := db.QueryRow(
+	err := db.QueryRowContext(ctx,
 		"SELECT id, email, api_key, status, created_at, updated_at FROM users WHERE api_key = ? AND status = 'active'",
 		keyHash,
 	).Scan(&user.ID, &user.Email, &user.APIKey, &user.Status, &createdAt, &updatedAt)
@@ -171,9 +179,9 @@ func (db *DB) GetUserByAPIKey(apiKey string) (*User, error) {
 	return &user, nil
 }
 
-func (db *DB) CreateUUIDRecord(uuid string, userID int64) error {
+func (db *DB) CreateUUIDRecord(ctx context.Context, uuid string, userID int64) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := db.Exec(
+	_, err := db.ExecContext(ctx,
 		"INSERT INTO uuids (uuid, user_id, created_at) VALUES (?, ?, ?)",
 		uuid, userID, now,
 	)
@@ -181,6 +189,15 @@ func (db *DB) CreateUUIDRecord(uuid string, userID int64) error {
 		return parseDBError(err)
 	}
 	return nil
+}
+
+func (db *DB) CreateCollisionRecord(ctx context.Context, userID int64) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := db.ExecContext(ctx,
+		"INSERT INTO collisions (user_id, collision_ts) VALUES (?, ?)",
+		userID, now,
+	)
+	return err
 }
 
 func hashAPIKey(key string) string {
